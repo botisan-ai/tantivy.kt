@@ -3,6 +3,7 @@ package ai.botisan.tantivy
 import ai.botisan.tantivy.ffi.DocumentField
 import ai.botisan.tantivy.ffi.TantivyIndex
 import ai.botisan.tantivy.ffi.TantivyIndexException
+import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -23,6 +24,11 @@ public data class TantivySearchResults<T>(val count: Long, val hits: List<Tantiv
  * Typed index over the UniFFI [TantivyIndex] — port of the Swift
  * `TantivySwiftIndex` actor. Operations are serialized through a [Mutex] and
  * run on [Dispatchers.IO].
+ *
+ * Failure contract: adapter encoding problems throw [TantivyEncodingException]
+ * before anything crosses the FFI; argument-contract violations throw
+ * [IllegalArgumentException]; native failures throw the generated
+ * `ai.botisan.tantivy.ffi.TantivyIndexException` (documented raw contract).
  */
 public class TypedTantivyIndex<T> private constructor(
     private val index: TantivyIndex,
@@ -41,6 +47,12 @@ public class TypedTantivyIndex<T> private constructor(
         ): TypedTantivyIndex<T> = withContext(Dispatchers.IO) {
             TypedTantivyIndex(TantivyIndex.newWithSchema(path, schema.newBuilder()), schema, adapter)
         }
+
+        public suspend fun <T> open(
+            directory: File,
+            schema: TantivySchema,
+            adapter: TantivyDocumentAdapter<T>,
+        ): TypedTantivyIndex<T> = open(directory.absolutePath, schema, adapter)
     }
 
     public suspend fun clear(): Unit = locked { index.clearIndex() }
@@ -64,6 +76,25 @@ public class TypedTantivyIndex<T> private constructor(
     }
 
     public suspend fun commit(): Unit = locked { index.commit() }
+
+    /**
+     * Deletes any existing document with [doc]'s id value, then adds [doc]
+     * (uncommitted — call [commit]). Both steps run under one lock. [idField]
+     * defaults to the schema's single `idField`; pass it explicitly when the
+     * schema declares several. Note the delete commits pending changes first
+     * (Rust core behavior).
+     */
+    public suspend fun upsert(doc: T, idField: String? = null): Unit = locked {
+        val resolved = idField ?: requireNotNull(schema.idFieldNames.singleOrNull()) {
+            "upsert requires exactly one idField in the schema (found ${schema.idFieldNames}) or an explicit idField argument"
+        }
+        require(resolved in schema.idFieldNames) { "'$resolved' is not an idField of the schema" }
+        val writer = TantivyDocumentWriter(schema).also { adapter.encode(doc, it) }
+        val idValue = writer.firstFfiValue(resolved)
+            ?: throw TantivyEncodingException.MissingIdValue(resolved)
+        index.deleteDoc(DocumentField(resolved, idValue))
+        index.indexDoc(writer.build())
+    }
 
     /** Deletes documents whose [field] equals [value]; commits internally (Rust behavior). */
     public suspend fun deleteDoc(field: String, value: TantivyValue): Unit =
@@ -90,6 +121,8 @@ public class TypedTantivyIndex<T> private constructor(
 
     public suspend fun search(query: TantivyQuery, limit: Int = 10, offset: Int = 0): TantivySearchResults<T> =
         locked {
+            require(limit > 0) { "limit must be positive (got $limit)" }
+            require(offset >= 0) { "offset must be non-negative (got $offset)" }
             val results = index.searchDsl(query.toJson(), limit.toUInt(), offset.toUInt())
             TantivySearchResults(
                 count = results.count.toLong(),
@@ -97,21 +130,37 @@ public class TypedTantivyIndex<T> private constructor(
             )
         }
 
-    /** Convenience for the common query-string search (BM25 over [defaultFields], optional fuzzy). */
+    /**
+     * Convenience for the common query-string search (BM25 over [defaultFields],
+     * optional fuzzy). [filter] is ANDed with the text query when present.
+     */
     public suspend fun searchText(
         query: String,
         defaultFields: List<String> = schema.defaultTextFieldNames,
         fuzzyFields: List<TantivyQuery.FuzzyField> = emptyList(),
+        filter: TantivyQuery? = null,
         limit: Int = 10,
         offset: Int = 0,
-    ): TantivySearchResults<T> =
-        search(TantivyQuery.QueryString(query, defaultFields, fuzzyFields), limit, offset)
+    ): TantivySearchResults<T> {
+        val text = TantivyQuery.QueryString(query, defaultFields, fuzzyFields)
+        val combined = if (filter == null) {
+            text
+        } else {
+            TantivyQuery.Boolean(
+                listOf(
+                    TantivyQuery.Clause(TantivyQuery.Occur.MUST, text),
+                    TantivyQuery.Clause(TantivyQuery.Occur.MUST, filter),
+                ),
+            )
+        }
+        return search(combined, limit, offset)
+    }
 
     override fun close() {
         index.destroy()
     }
 
-    private fun encode(doc: T) = TantivyDocumentWriter().also { adapter.encode(doc, it) }.build()
+    private fun encode(doc: T) = TantivyDocumentWriter(schema).also { adapter.encode(doc, it) }.build()
 
     private suspend fun <R> locked(block: () -> R): R =
         withContext(Dispatchers.IO) { mutex.withLock { block() } }

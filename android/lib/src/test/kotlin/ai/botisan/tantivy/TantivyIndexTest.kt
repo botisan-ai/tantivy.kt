@@ -29,8 +29,12 @@ class TantivyIndexTest {
     private fun tempIndexPath(name: String): String =
         Files.createTempDirectory("tantivy-$name").toAbsolutePath().toString()
 
-    private fun <T> encodeFields(adapter: TantivyDocumentAdapter<T>, value: T): TantivyDocumentFields =
-        TantivyDocumentWriter().also { adapter.encode(value, it) }.build()
+    private fun <T> encodeFields(
+        schema: TantivySchema,
+        adapter: TantivyDocumentAdapter<T>,
+        value: T,
+    ): TantivyDocumentFields =
+        TantivyDocumentWriter(schema).also { adapter.encode(value, it) }.build()
 
     private fun TantivyDocumentFields.countOf(name: String): Int = fields.count { it.name == name }
 
@@ -61,7 +65,7 @@ class TantivyIndexTest {
             category = "/sample",
             meta = ArticleMeta(source = "kotlin", rating = 1),
         )
-        val fields = encodeFields(UnifiedDocAdapter, doc)
+        val fields = encodeFields(UNIFIED_SCHEMA, UnifiedDocAdapter, doc)
         assertEquals(
             listOf("id", "title", "body", "score", "isActive", "category", "meta"),
             fields.fields.map { it.name },
@@ -197,7 +201,7 @@ class TantivyIndexTest {
             note = "Weekly grocery run",
         )
 
-        val native = encodeFields(MultiValueDocAdapter, doc)
+        val native = encodeFields(MULTI_VALUE_SCHEMA, MultiValueDocAdapter, doc)
         assertEquals(2, native.countOf("tags"))
         assertEquals(2, native.countOf("receiptTagIds"))
 
@@ -259,7 +263,7 @@ class TantivyIndexTest {
             metas = listOf(ArticleMeta("ocr", 5), ArticleMeta("manual", 4)),
         )
 
-        val native = encodeFields(MultiValueAllDocAdapter, doc)
+        val native = encodeFields(MULTI_VALUE_ALL_SCHEMA, MultiValueAllDocAdapter, doc)
         assertEquals(doc.tags.size, native.countOf("tags"))
         assertEquals(doc.amounts.size, native.countOf("amounts"))
         assertEquals(doc.deltas.size, native.countOf("deltas"))
@@ -530,32 +534,5 @@ object MultiValueAllDocAdapter : TantivyDocumentAdapter<MultiValueAllDoc> {
     )
 }
 
-// ============================================================================
-// Multi-value read accessors.
-//
-// Swift's TantivyDocumentFieldMap exposes u64s/i64s/f64s/bools/dates/
-// bytesValues/jsons; the Kotlin TantivyFieldMap currently only ships the
-// `texts`/`facets` plural accessors, so the rest are derived here from the
-// public `values(name)` API rather than by widening the library surface.
-// ============================================================================
-
-fun TantivyFieldMap.u64s(name: String): List<Long> =
-    values(name).filterIsInstance<TantivyValue.U64>().map { it.value }
-
-fun TantivyFieldMap.i64s(name: String): List<Long> =
-    values(name).filterIsInstance<TantivyValue.I64>().map { it.value }
-
-fun TantivyFieldMap.f64s(name: String): List<Double> =
-    values(name).filterIsInstance<TantivyValue.F64>().map { it.value }
-
-fun TantivyFieldMap.bools(name: String): List<Boolean> =
-    values(name).filterIsInstance<TantivyValue.Bool>().map { it.value }
-
-fun TantivyFieldMap.datesMicros(name: String): List<Long> =
-    values(name).filterIsInstance<TantivyValue.DateMicros>().map { it.epochMicros }
-
-fun TantivyFieldMap.bytesValues(name: String): List<ByteArray> =
-    values(name).filterIsInstance<TantivyValue.Bytes>().map { it.value }
-
-fun TantivyFieldMap.jsons(name: String): List<String> =
-    values(name).filterIsInstance<TantivyValue.Json>().map { it.json }
+// TantivyFieldMap ships plural accessors (u64s/i64s/f64s/bools/datesMicros/
+// bytesValues/jsons) as members; the tests above use them directly.
