@@ -10,6 +10,8 @@ val hostLibName =
     if (System.getProperty("os.name").startsWith("Mac")) "libtantivy.dylib" else "libtantivy.so"
 val androidSdkDir =
     System.getenv("ANDROID_HOME") ?: "${System.getProperty("user.home")}/Library/Android/sdk"
+// Keep in sync with build-android.sh; cargo-ndk otherwise floats to the newest installed NDK.
+val ndkPin = "28.2.13676358"
 
 // Host build feeds uniffi-bindgen (the Android .so is stripped, which removes the
 // ELF .symtab uniffi reads; the host dylib keeps its symbols) and the JVM unit tests.
@@ -21,6 +23,7 @@ val cargoBuildHost = tasks.register<Exec>("cargoBuildHost") {
 val cargoNdkBuild = tasks.register<Exec>("cargoNdkBuild") {
     workingDir(rustDir)
     environment("ANDROID_HOME", androidSdkDir)
+    environment("ANDROID_NDK_HOME", "$androidSdkDir/ndk/$ndkPin")
     commandLine(
         "cargo", "ndk",
         "-t", "arm64-v8a", "-t", "x86_64",
