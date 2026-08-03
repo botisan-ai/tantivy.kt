@@ -218,6 +218,12 @@ pub struct TantivySchemaBuilder {
     builder: Mutex<Option<tantivy::schema::SchemaBuilder>>,
 }
 
+impl Default for TantivySchemaBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[uniffi::export]
 impl TantivySchemaBuilder {
     #[uniffi::constructor]
@@ -587,7 +593,7 @@ fn add_field_value(
             let dt = tantivy::DateTime::from_timestamp_micros(*ts);
             doc.add_date(field, dt);
         }
-        FieldValue::Bytes(b) => doc.add_bytes(field, &b),
+        FieldValue::Bytes(b) => doc.add_bytes(field, b),
         FieldValue::Facet(path) => {
             let facet = Facet::from_text(path)?;
             doc.add_facet(field, facet);
@@ -1089,7 +1095,7 @@ impl TantivyIndex {
             let retrieved_doc: TantivyDocument = searcher.doc(*doc_address)?;
             doc_to_fields(&schema, retrieved_doc)
         } else {
-            Err(TantivyIndexError::DocRetrievalError(format!("{}", id.name)))
+            Err(TantivyIndexError::DocRetrievalError(id.name.to_string()))
         }
     }
 

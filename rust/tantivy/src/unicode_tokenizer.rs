@@ -78,14 +78,14 @@ fn flush_pending_token(
     current_start: &mut Option<usize>,
     current_end: &mut usize,
 ) {
-    if let Some(start) = *current_start {
-        if !current_text.is_empty() {
-            tokens.push(PendingToken {
-                text: std::mem::take(current_text),
-                offset_from: word_offset + start,
-                offset_to: word_offset + *current_end,
-            });
-        }
+    if let Some(start) = *current_start
+        && !current_text.is_empty()
+    {
+        tokens.push(PendingToken {
+            text: std::mem::take(current_text),
+            offset_from: word_offset + start,
+            offset_to: word_offset + *current_end,
+        });
     }
 
     *current_start = None;
@@ -198,14 +198,14 @@ fn tokenize_text(text: &str) -> VecDeque<PendingToken> {
     let words: UnicodeWordIndices<'_> = text.unicode_word_indices();
     for (offset_from, word) in words {
         for token in split_word_tokens(offset_from, word) {
-            if let Some(last_token) = merged_tokens.last_mut() {
-                if token.offset_from >= last_token.offset_to {
-                    let separator = &text[last_token.offset_to..token.offset_from];
-                    if separator_is_apostrophe_run(separator) {
-                        last_token.text.push_str(&token.text);
-                        last_token.offset_to = token.offset_to;
-                        continue;
-                    }
+            if let Some(last_token) = merged_tokens.last_mut()
+                && token.offset_from >= last_token.offset_to
+            {
+                let separator = &text[last_token.offset_to..token.offset_from];
+                if separator_is_apostrophe_run(separator) {
+                    last_token.text.push_str(&token.text);
+                    last_token.offset_to = token.offset_to;
+                    continue;
                 }
             }
             merged_tokens.push(token);
@@ -231,11 +231,11 @@ impl TokenStream for UnicodeTokenStream<'_> {
     }
 
     fn token(&self) -> &Token {
-        &self.token
+        self.token
     }
 
     fn token_mut(&mut self) -> &mut Token {
-        &mut self.token
+        self.token
     }
 }
 

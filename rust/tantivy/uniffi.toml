@@ -1,4 +1,7 @@
 # Kotlin binding config. `android = true` deliberately NOT set (host-JVM tests).
+# `disable_java_cleaner = true` forces the JNA cleaner — java.lang.ref.Cleaner
+# is API 33+ on Android and its mere reference trips lint NewApi at minSdk 24.
 [bindings.kotlin]
 package_name = "ai.botisan.tantivy.ffi"
 cdylib_name = "tantivy"
+disable_java_cleaner = true

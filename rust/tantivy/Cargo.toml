@@ -24,3 +24,7 @@ uniffi = { workspace = true, features = ["build"] }
 [lib]
 crate-type = ["cdylib", "staticlib", "lib"]
 name = "tantivy"
+# The lib target shares its name with the upstream `tantivy` dependency, which
+# makes rustdoc's doctest pass ambiguous (two candidate rlibs). This crate owns
+# no doctests; the cdylib name must stay `tantivy` for the JNA bindings.
+doctest = false
