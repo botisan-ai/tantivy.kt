@@ -1,0 +1,26 @@
+# Rust core mirrored from tantivy.swift @ 0.3.4 (commit dae1d22).
+# Sync src/*.rs manually when the upstream Swift repo's core changes.
+[package]
+name = "tantivy-kt"
+version = "0.3.4"
+edition = "2024"
+
+[dependencies]
+serde = "1.0.228"
+serde_json = "1.0.145"
+# zstd stays disabled (mirrors upstream; also avoids the only C dependency)
+tantivy = { version = "0.25.0", default-features = false, features = [
+    "mmap",
+    "stopwords",
+    "lz4-compression",
+] }
+thiserror = "2.0.17"
+unicode-segmentation = "1.12.0"
+uniffi = { workspace = true }
+
+[build-dependencies]
+uniffi = { workspace = true, features = ["build"] }
+
+[lib]
+crate-type = ["cdylib", "staticlib", "lib"]
+name = "tantivy"

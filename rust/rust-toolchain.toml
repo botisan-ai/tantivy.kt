@@ -1,0 +1,8 @@
+[toolchain]
+channel = "stable"
+targets = [
+    # Android (the only build targets of this repo; iOS lives in HNSW.swift)
+    "aarch64-linux-android",
+    "x86_64-linux-android",
+]
+components = ["clippy", "rustfmt"]

@@ -1,0 +1,4 @@
+# Kotlin binding config. `android = true` deliberately NOT set (host-JVM tests).
+[bindings.kotlin]
+package_name = "ai.botisan.tantivy.ffi"
+cdylib_name = "tantivy"
