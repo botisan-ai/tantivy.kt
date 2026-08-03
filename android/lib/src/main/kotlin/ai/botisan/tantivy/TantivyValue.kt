@@ -22,6 +22,14 @@ public sealed class TantivyEncodingException(message: String) : Exception(messag
     /** An operation needed an id value the encoded document does not carry. */
     public class MissingIdValue(public val field: String) :
         TantivyEncodingException("Encoded document has no value for id field '$field'")
+
+    /**
+     * An operation needed exactly one id value but the adapter wrote several —
+     * the document would have multiple identities and later upserts/deletes
+     * could not address it unambiguously.
+     */
+    public class AmbiguousIdValue(public val field: String, count: Int) :
+        TantivyEncodingException("Encoded document has $count values for id field '$field' (exactly 1 required)")
 }
 
 /**

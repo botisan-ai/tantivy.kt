@@ -90,8 +90,12 @@ public class TypedTantivyIndex<T> private constructor(
         }
         require(resolved in schema.idFieldNames) { "'$resolved' is not an idField of the schema" }
         val writer = TantivyDocumentWriter(schema).also { adapter.encode(doc, it) }
-        val idValue = writer.firstFfiValue(resolved)
-            ?: throw TantivyEncodingException.MissingIdValue(resolved)
+        // Exactly one id value: zero can't be addressed, several would give the
+        // document multiple identities and make later upserts/deletes ambiguous.
+        val count = writer.valueCount(resolved)
+        if (count == 0) throw TantivyEncodingException.MissingIdValue(resolved)
+        if (count > 1) throw TantivyEncodingException.AmbiguousIdValue(resolved, count)
+        val idValue = checkNotNull(writer.firstFfiValue(resolved))
         index.deleteDoc(DocumentField(resolved, idValue))
         index.indexDoc(writer.build())
     }
