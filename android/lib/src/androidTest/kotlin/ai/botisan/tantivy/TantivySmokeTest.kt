@@ -40,4 +40,27 @@ class TantivySmokeTest {
         dir.deleteRecursively()
         Unit
     }
+
+    @Test
+    fun indexPersistsAcrossCloseAndReopenOnDevice() = runBlocking {
+        val ctx = InstrumentationRegistry.getInstrumentation().targetContext
+        val dir = File(ctx.filesDir, "tantivy_reopen_${System.currentTimeMillis()}")
+        val schema = tantivySchema {
+            idField("id")
+            textField("text")
+        }
+        try {
+            TypedTantivyIndex.open(dir, schema, NoteAdapter).use { index ->
+                index.index(Note("n1", "coffee at blue bottle"))
+                assertEquals("n1", index.searchText("coffee", limit = 1).hits.first().doc.id)
+            }
+
+            TypedTantivyIndex.open(dir, schema, NoteAdapter).use { reopened ->
+                assertEquals("n1", reopened.searchText("coffee", limit = 1).hits.first().doc.id)
+            }
+        } finally {
+            dir.deleteRecursively()
+        }
+        Unit
+    }
 }
