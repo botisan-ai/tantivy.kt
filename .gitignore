@@ -6,3 +6,5 @@
 .DS_Store
 .idea/
 *.iml
+/android/minified-smoke/build/
+/android/minified-smoke/.cxx/

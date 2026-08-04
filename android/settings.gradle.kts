@@ -16,3 +16,5 @@ dependencyResolutionManagement {
 
 rootProject.name = "tantivy-android"
 include(":lib")
+
+include(":minified-smoke")

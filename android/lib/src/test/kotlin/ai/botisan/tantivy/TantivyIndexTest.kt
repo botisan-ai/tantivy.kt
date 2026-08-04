@@ -1,6 +1,7 @@
 package ai.botisan.tantivy
 
 import ai.botisan.tantivy.ffi.TantivyDocumentFields
+import ai.botisan.tantivy.ffi.TantivyIndexException
 import java.nio.file.Files
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.Json
@@ -12,6 +13,7 @@ import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 /**
@@ -29,8 +31,12 @@ class TantivyIndexTest {
     private fun tempIndexPath(name: String): String =
         Files.createTempDirectory("tantivy-$name").toAbsolutePath().toString()
 
-    private fun <T> encodeFields(adapter: TantivyDocumentAdapter<T>, value: T): TantivyDocumentFields =
-        TantivyDocumentWriter().also { adapter.encode(value, it) }.build()
+    private fun <T> encodeFields(
+        schema: TantivySchema,
+        adapter: TantivyDocumentAdapter<T>,
+        value: T,
+    ): TantivyDocumentFields =
+        TantivyDocumentWriter(schema).also { adapter.encode(value, it) }.build()
 
     private fun TantivyDocumentFields.countOf(name: String): Int = fields.count { it.name == name }
 
@@ -61,7 +67,7 @@ class TantivyIndexTest {
             category = "/sample",
             meta = ArticleMeta(source = "kotlin", rating = 1),
         )
-        val fields = encodeFields(UnifiedDocAdapter, doc)
+        val fields = encodeFields(UNIFIED_SCHEMA, UnifiedDocAdapter, doc)
         assertEquals(
             listOf("id", "title", "body", "score", "isActive", "category", "meta"),
             fields.fields.map { it.name },
@@ -197,7 +203,7 @@ class TantivyIndexTest {
             note = "Weekly grocery run",
         )
 
-        val native = encodeFields(MultiValueDocAdapter, doc)
+        val native = encodeFields(MULTI_VALUE_SCHEMA, MultiValueDocAdapter, doc)
         assertEquals(2, native.countOf("tags"))
         assertEquals(2, native.countOf("receiptTagIds"))
 
@@ -259,7 +265,7 @@ class TantivyIndexTest {
             metas = listOf(ArticleMeta("ocr", 5), ArticleMeta("manual", 4)),
         )
 
-        val native = encodeFields(MultiValueAllDocAdapter, doc)
+        val native = encodeFields(MULTI_VALUE_ALL_SCHEMA, MultiValueAllDocAdapter, doc)
         assertEquals(doc.tags.size, native.countOf("tags"))
         assertEquals(doc.amounts.size, native.countOf("amounts"))
         assertEquals(doc.deltas.size, native.countOf("deltas"))
@@ -342,6 +348,68 @@ class TantivyIndexTest {
                 ).count,
             )
         }
+    }
+
+    // -------------------------------------- batch and staged-delete contracts
+
+    private data class Tagged(val id: String, val tag: String)
+
+    private object TaggedAdapter : TantivyDocumentAdapter<Tagged> {
+        override fun encode(value: Tagged, doc: TantivyDocumentWriter) {
+            doc.text("id", value.id)
+            doc.facet("tag", value.tag)
+        }
+
+        override fun decode(fields: TantivyFieldMap): Tagged =
+            Tagged(fields.text("id")!!, fields.facet("tag")!!)
+    }
+
+    private val taggedSchema = tantivySchema {
+        idField("id")
+        facetField("tag")
+    }
+
+    /**
+     * A natively-invalid value (facet without a leading slash) in a later
+     * batch document must reject the whole batch with nothing pending and
+     * nothing committed — the earlier valid document must not survive in the
+     * writer as an orphan for a later commit to publish.
+     */
+    @Test
+    fun indexAllAddsNothingWhenALaterDocumentFailsNativeValidation() = runTest {
+        val index = TypedTantivyIndex.open(tempIndexPath("batch-atomicity"), taggedSchema, TaggedAdapter)
+        try {
+            index.indexAll(listOf(Tagged("a", "/ok"), Tagged("b", "not-a-facet")))
+            fail("expected the native facet validation to reject the batch")
+        } catch (_: TantivyIndexException) {
+            // Facet::from_text rejects the second document.
+        }
+        index.commit()
+        assertEquals(0L, index.search(TantivyQuery.All).count)
+
+        index.indexAll(listOf(Tagged("a", "/ok"), Tagged("b", "/ok")))
+        assertEquals(2L, index.search(TantivyQuery.All).count)
+        index.close()
+    }
+
+    /**
+     * [TypedTantivyIndex.deleteDocWithoutCommit] stages the delete in the open
+     * transaction: it masks the pending add before it, publishes nothing on
+     * its own, and leaves a later add of the same id value untouched.
+     */
+    @Test
+    fun deleteDocWithoutCommitMasksOnlyDocumentsAddedBeforeIt() = runTest {
+        val index = TypedTantivyIndex.open(tempIndexPath("staged-delete"), taggedSchema, TaggedAdapter)
+        index.add(Tagged("x", "/old"))
+        index.deleteDocWithoutCommit("id", TantivyValue.Text("x"))
+        // Nothing became durable from the staged delete itself.
+        assertEquals(0L, index.search(TantivyQuery.All).count)
+
+        index.add(Tagged("x", "/new"))
+        index.commit()
+        assertEquals(1L, index.search(TantivyQuery.All).count)
+        assertEquals("/new", index.getDoc("id", TantivyValue.Text("x")).tag)
+        index.close()
     }
 
     // --------------------------------------------------------- index factories
@@ -530,32 +598,5 @@ object MultiValueAllDocAdapter : TantivyDocumentAdapter<MultiValueAllDoc> {
     )
 }
 
-// ============================================================================
-// Multi-value read accessors.
-//
-// Swift's TantivyDocumentFieldMap exposes u64s/i64s/f64s/bools/dates/
-// bytesValues/jsons; the Kotlin TantivyFieldMap currently only ships the
-// `texts`/`facets` plural accessors, so the rest are derived here from the
-// public `values(name)` API rather than by widening the library surface.
-// ============================================================================
-
-fun TantivyFieldMap.u64s(name: String): List<Long> =
-    values(name).filterIsInstance<TantivyValue.U64>().map { it.value }
-
-fun TantivyFieldMap.i64s(name: String): List<Long> =
-    values(name).filterIsInstance<TantivyValue.I64>().map { it.value }
-
-fun TantivyFieldMap.f64s(name: String): List<Double> =
-    values(name).filterIsInstance<TantivyValue.F64>().map { it.value }
-
-fun TantivyFieldMap.bools(name: String): List<Boolean> =
-    values(name).filterIsInstance<TantivyValue.Bool>().map { it.value }
-
-fun TantivyFieldMap.datesMicros(name: String): List<Long> =
-    values(name).filterIsInstance<TantivyValue.DateMicros>().map { it.epochMicros }
-
-fun TantivyFieldMap.bytesValues(name: String): List<ByteArray> =
-    values(name).filterIsInstance<TantivyValue.Bytes>().map { it.value }
-
-fun TantivyFieldMap.jsons(name: String): List<String> =
-    values(name).filterIsInstance<TantivyValue.Json>().map { it.json }
+// TantivyFieldMap ships plural accessors (u64s/i64s/f64s/bools/datesMicros/
+// bytesValues/jsons) as members; the tests above use them directly.

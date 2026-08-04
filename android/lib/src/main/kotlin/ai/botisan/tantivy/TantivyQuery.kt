@@ -24,13 +24,21 @@ public sealed class TantivyQuery {
 
     public data class Boolean(val clauses: List<Clause>) : TantivyQuery()
 
-    public data class Phrase(val field: String, val terms: List<String>, val slop: Int? = null) : TantivyQuery()
+    public data class Phrase(val field: String, val terms: List<String>, val slop: Int? = null) : TantivyQuery() {
+        init {
+            slop?.let { require(it >= 0) { "slop must be non-negative (got $it)" } }
+        }
+    }
 
     public data class PhrasePrefix(
         val field: String,
         val terms: List<String>,
         val maxExpansions: Int? = null,
-    ) : TantivyQuery()
+    ) : TantivyQuery() {
+        init {
+            maxExpansions?.let { require(it >= 0) { "maxExpansions must be non-negative (got $it)" } }
+        }
+    }
 
     public data class Range(
         val field: String,
@@ -47,18 +55,35 @@ public sealed class TantivyQuery {
         val term: String,
         val distance: Int = 1,
         val transposeCostOne: kotlin.Boolean = false,
-    ) : TantivyQuery()
+    ) : TantivyQuery() {
+        init {
+            // Deserialized as u8 on the Rust side.
+            require(distance in 0..255) { "distance must be in 0..255 (got $distance)" }
+        }
+    }
 
     public data class Exists(val field: String) : TantivyQuery()
 
-    public data class Boost(val query: TantivyQuery, val boost: Float) : TantivyQuery()
+    public data class Boost(val query: TantivyQuery, val boost: Float) : TantivyQuery() {
+        init {
+            require(boost.isFinite()) { "boost must be finite (got $boost)" }
+        }
+    }
 
-    public data class ConstScore(val query: TantivyQuery, val score: Float) : TantivyQuery()
+    public data class ConstScore(val query: TantivyQuery, val score: Float) : TantivyQuery() {
+        init {
+            require(score.isFinite()) { "score must be finite (got $score)" }
+        }
+    }
 
     public data class DisjunctionMax(
         val queries: List<TantivyQuery>,
         val tieBreaker: Float? = null,
-    ) : TantivyQuery()
+    ) : TantivyQuery() {
+        init {
+            tieBreaker?.let { require(it.isFinite()) { "tieBreaker must be finite (got $it)" } }
+        }
+    }
 
     public data class QueryString(
         val query: String,
@@ -79,7 +104,17 @@ public sealed class TantivyQuery {
         val prefix: kotlin.Boolean = false,
         val distance: Int = 1,
         val transposeCostOne: kotlin.Boolean = false,
-    )
+    ) {
+        init {
+            require(distance in 0..255) { "distance must be in 0..255 (got $distance)" }
+        }
+    }
+
+    public companion object {
+        /** Matches documents whose facet [field] contains any of [paths] — e.g. tag filters. */
+        public fun facetAnyOf(field: String, paths: List<String>): TantivyQuery =
+            TermSet(paths.map { field to TantivyValue.Facet(it) })
+    }
 
     public fun toJson(): String = toJsonObject().toString()
 

@@ -10,9 +10,53 @@ import ai.botisan.tantivy.ffi.TantivySchemaBuilder
 import ai.botisan.tantivy.ffi.TantivyTokenizer
 import ai.botisan.tantivy.ffi.TextFieldOptions
 
-public typealias Tokenizer = TantivyTokenizer
-public typealias RecordOption = TantivyIndexRecordOption
-public typealias DatePrecision = TantivyDatePrecision
+/*
+ * Facade enums: the public schema API never exposes the UniFFI-generated types,
+ * so generator/ABI churn cannot leak into consumer signatures.
+ */
+
+public enum class Tokenizer {
+    RAW,
+    DEFAULT,
+    UNICODE,
+    EN_STEM,
+    WHITESPACE,
+    ;
+
+    internal fun toFfi(): TantivyTokenizer = when (this) {
+        RAW -> TantivyTokenizer.RAW
+        DEFAULT -> TantivyTokenizer.DEFAULT
+        UNICODE -> TantivyTokenizer.UNICODE
+        EN_STEM -> TantivyTokenizer.EN_STEM
+        WHITESPACE -> TantivyTokenizer.WHITESPACE
+    }
+}
+
+public enum class RecordOption {
+    BASIC,
+    WITH_FREQS,
+    WITH_FREQS_AND_POSITIONS,
+    ;
+
+    internal fun toFfi(): TantivyIndexRecordOption = when (this) {
+        BASIC -> TantivyIndexRecordOption.BASIC
+        WITH_FREQS -> TantivyIndexRecordOption.WITH_FREQS
+        WITH_FREQS_AND_POSITIONS -> TantivyIndexRecordOption.WITH_FREQS_AND_POSITIONS
+    }
+}
+
+public enum class DatePrecision {
+    SECONDS,
+    MILLISECONDS,
+    MICROSECONDS,
+    ;
+
+    internal fun toFfi(): TantivyDatePrecision = when (this) {
+        SECONDS -> TantivyDatePrecision.SECONDS
+        MILLISECONDS -> TantivyDatePrecision.MILLISECONDS
+        MICROSECONDS -> TantivyDatePrecision.MICROSECONDS
+    }
+}
 
 /**
  * Explicit schema declaration — the Kotlin replacement for TantivySwift's
@@ -21,6 +65,9 @@ public typealias DatePrecision = TantivyDatePrecision
  */
 public class TantivySchema internal constructor(internal val fields: List<FieldSpec>) {
 
+    /** All declared field names, in declaration order. */
+    public val fieldNames: List<String> = fields.map { it.name }
+
     /** Fields declared with [TantivySchemaScope.idField] (raw-tokenized, fast text fields). */
     public val idFieldNames: List<String> = fields.filterIsInstance<FieldSpec.Id>().map { it.name }
 
@@ -28,14 +75,29 @@ public class TantivySchema internal constructor(internal val fields: List<FieldS
     public val defaultTextFieldNames: List<String> =
         fields.filterIsInstance<FieldSpec.Text>().map { it.name }
 
+    private val specsByName: Map<String, FieldSpec> = fields.associateBy { it.name }
+
     /**
      * Stable schema fingerprint (sorted `name:spec` lines). Intentionally NOT
      * compatible with HybridSearch.swift's Swift-type-derived fingerprint.
      */
     public fun fingerprint(): String = fields.map { it.fingerprint() }.sorted().joinToString("|")
 
-    /** Builds a fresh FFI schema builder — for advanced composition (e.g. HybridSearch adds its own fields). */
-    public fun newBuilder(): TantivySchemaBuilder {
+    /**
+     * A new schema containing these fields plus the ones declared in [block]
+     * (names must stay unique) — for composition, e.g. HybridSearch appends its
+     * internal `__doc_id` field.
+     */
+    public fun extending(block: TantivySchemaScope.() -> Unit): TantivySchema {
+        val scope = TantivySchemaScope(fields)
+        scope.block()
+        return scope.build()
+    }
+
+    internal fun specFor(name: String): FieldSpec? = specsByName[name]
+
+    /** Builds a fresh FFI schema builder. */
+    internal fun newBuilder(): TantivySchemaBuilder {
         val builder = TantivySchemaBuilder()
         fields.forEach { it.register(builder) }
         return builder
@@ -48,13 +110,23 @@ public class TantivySchema internal constructor(internal val fields: List<FieldS
 
         abstract fun fingerprint(): String
 
+        /** The value kind this field stores, e.g. "text" — used in error messages. */
+        abstract val kindLabel: String
+
+        /** Whether [value]'s kind matches this field's declared kind. */
+        abstract fun accepts(value: TantivyValue): Boolean
+
         data class Id(override val name: String) : FieldSpec() {
+            override val kindLabel: String get() = "text"
+
+            override fun accepts(value: TantivyValue): Boolean = value is TantivyValue.Text
+
             override fun register(builder: TantivySchemaBuilder) {
                 builder.addTextField(
                     name,
                     TextFieldOptions(
-                        tokenizer = Tokenizer.RAW,
-                        record = RecordOption.BASIC,
+                        tokenizer = TantivyTokenizer.RAW,
+                        record = TantivyIndexRecordOption.BASIC,
                         stored = true,
                         fast = true,
                         fieldnorms = false,
@@ -73,8 +145,15 @@ public class TantivySchema internal constructor(internal val fields: List<FieldS
             val fast: Boolean,
             val fieldnorms: Boolean,
         ) : FieldSpec() {
+            override val kindLabel: String get() = "text"
+
+            override fun accepts(value: TantivyValue): Boolean = value is TantivyValue.Text
+
             override fun register(builder: TantivySchemaBuilder) {
-                builder.addTextField(name, TextFieldOptions(tokenizer, record, stored, fast, fieldnorms))
+                builder.addTextField(
+                    name,
+                    TextFieldOptions(tokenizer.toFfi(), record.toFfi(), stored, fast, fieldnorms),
+                )
             }
 
             override fun fingerprint() = "$name:text($tokenizer,$record,$stored,$fast,$fieldnorms)"
@@ -89,6 +168,15 @@ public class TantivySchema internal constructor(internal val fields: List<FieldS
             val fieldnorms: Boolean,
         ) : FieldSpec() {
             enum class Kind { U64, I64, F64, BOOL }
+
+            override val kindLabel: String get() = kind.name.lowercase()
+
+            override fun accepts(value: TantivyValue): Boolean = when (kind) {
+                Kind.U64 -> value is TantivyValue.U64
+                Kind.I64 -> value is TantivyValue.I64
+                Kind.F64 -> value is TantivyValue.F64
+                Kind.BOOL -> value is TantivyValue.Bool
+            }
 
             override fun register(builder: TantivySchemaBuilder) {
                 val options = NumericFieldOptions(indexed, stored, fast, fieldnorms)
@@ -111,8 +199,12 @@ public class TantivySchema internal constructor(internal val fields: List<FieldS
             val fieldnorms: Boolean,
             val precision: DatePrecision,
         ) : FieldSpec() {
+            override val kindLabel: String get() = "date"
+
+            override fun accepts(value: TantivyValue): Boolean = value is TantivyValue.DateMicros
+
             override fun register(builder: TantivySchemaBuilder) {
-                builder.addDateField(name, DateFieldOptions(indexed, stored, fast, fieldnorms, precision))
+                builder.addDateField(name, DateFieldOptions(indexed, stored, fast, fieldnorms, precision.toFfi()))
             }
 
             override fun fingerprint() = "$name:date($indexed,$stored,$fast,$fieldnorms,$precision)"
@@ -124,6 +216,10 @@ public class TantivySchema internal constructor(internal val fields: List<FieldS
             val fast: Boolean,
             val indexed: Boolean,
         ) : FieldSpec() {
+            override val kindLabel: String get() = "bytes"
+
+            override fun accepts(value: TantivyValue): Boolean = value is TantivyValue.Bytes
+
             override fun register(builder: TantivySchemaBuilder) {
                 builder.addBytesField(name, stored = stored, fast = fast, indexed = indexed)
             }
@@ -132,6 +228,10 @@ public class TantivySchema internal constructor(internal val fields: List<FieldS
         }
 
         data class FacetField(override val name: String, val stored: Boolean) : FieldSpec() {
+            override val kindLabel: String get() = "facet"
+
+            override fun accepts(value: TantivyValue): Boolean = value is TantivyValue.Facet
+
             override fun register(builder: TantivySchemaBuilder) {
                 builder.addFacetField(name, FacetFieldOptions(stored))
             }
@@ -150,10 +250,23 @@ public class TantivySchema internal constructor(internal val fields: List<FieldS
             val expandDots: Boolean,
             val fastTokenizer: Tokenizer?,
         ) : FieldSpec() {
+            override val kindLabel: String get() = "json"
+
+            override fun accepts(value: TantivyValue): Boolean = value is TantivyValue.Json
+
             override fun register(builder: TantivySchemaBuilder) {
                 builder.addJsonField(
                     name,
-                    JsonFieldOptions(stored, indexed, fast, tokenizer, record, fieldnorms, expandDots, fastTokenizer),
+                    JsonFieldOptions(
+                        stored,
+                        indexed,
+                        fast,
+                        tokenizer.toFfi(),
+                        record.toFfi(),
+                        fieldnorms,
+                        expandDots,
+                        fastTokenizer?.toFfi(),
+                    ),
                 )
             }
 
@@ -165,8 +278,10 @@ public class TantivySchema internal constructor(internal val fields: List<FieldS
 public fun tantivySchema(block: TantivySchemaScope.() -> Unit): TantivySchema =
     TantivySchemaScope().apply(block).build()
 
-public class TantivySchemaScope internal constructor() {
-    private val fields = mutableListOf<TantivySchema.FieldSpec>()
+public class TantivySchemaScope internal constructor(
+    initial: List<TantivySchema.FieldSpec> = emptyList(),
+) {
+    private val fields = initial.toMutableList()
 
     /** Raw-tokenized stored fast text field — the Swift `@IDField`. */
     public fun idField(name: String) {

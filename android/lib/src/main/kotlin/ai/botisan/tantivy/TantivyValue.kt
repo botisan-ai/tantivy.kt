@@ -9,6 +9,29 @@ import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 
+/** Thrown by [TantivyDocumentWriter] before anything crosses the FFI. */
+public sealed class TantivyEncodingException(message: String) : Exception(message) {
+    /** The adapter wrote a field name the schema does not declare (usually a typo). */
+    public class UnknownField(public val field: String, knownFields: List<String>) :
+        TantivyEncodingException("Unknown field '$field' — the schema declares: ${knownFields.joinToString()}")
+
+    /** The adapter wrote a value whose kind does not match the field's declared kind. */
+    public class ValueKindMismatch(public val field: String, expected: String, got: String) :
+        TantivyEncodingException("Field '$field' expects a $expected value but got $got")
+
+    /** An operation needed an id value the encoded document does not carry. */
+    public class MissingIdValue(public val field: String) :
+        TantivyEncodingException("Encoded document has no value for id field '$field'")
+
+    /**
+     * An operation needed exactly one id value but the adapter wrote several —
+     * the document would have multiple identities and later upserts/deletes
+     * could not address it unambiguously.
+     */
+    public class AmbiguousIdValue(public val field: String, count: Int) :
+        TantivyEncodingException("Encoded document has $count values for id field '$field' (exactly 1 required)")
+}
+
 /**
  * A typed field value, used both in documents and in queries. Mirrors the Rust
  * `FieldValue` enum; `toJsonElement()` matches its serde encoding
@@ -17,8 +40,12 @@ import kotlinx.serialization.json.put
 public sealed class TantivyValue {
     public data class Text(val value: String) : TantivyValue()
 
-    /** Interpreted as unsigned on the Rust side; negative values are invalid. */
-    public data class U64(val value: Long) : TantivyValue()
+    /** Interpreted as unsigned on the Rust side; the supported domain is 0..Long.MAX_VALUE. */
+    public data class U64(val value: Long) : TantivyValue() {
+        init {
+            require(value >= 0) { "U64 values must be non-negative (got $value)" }
+        }
+    }
 
     public data class I64(val value: Long) : TantivyValue()
 
@@ -39,6 +66,19 @@ public sealed class TantivyValue {
     public data class Facet(val path: String) : TantivyValue()
 
     public data class Json(val json: String) : TantivyValue()
+
+    internal val kindName: String
+        get() = when (this) {
+            is Text -> "text"
+            is U64 -> "u64"
+            is I64 -> "i64"
+            is F64 -> "f64"
+            is Bool -> "bool"
+            is DateMicros -> "date"
+            is Bytes -> "bytes"
+            is Facet -> "facet"
+            is Json -> "json"
+        }
 
     internal fun toFfi(): FieldValue = when (this) {
         is Text -> FieldValue.Text(value)
@@ -72,7 +112,12 @@ public sealed class TantivyValue {
     internal companion object {
         internal fun fromFfi(value: FieldValue): TantivyValue = when (value) {
             is FieldValue.Text -> Text(value.v1)
-            is FieldValue.U64 -> U64(value.v1.toLong())
+            is FieldValue.U64 -> {
+                check(value.v1 <= Long.MAX_VALUE.toULong()) {
+                    "u64 value ${value.v1} exceeds the supported Kotlin domain (0..Long.MAX_VALUE)"
+                }
+                U64(value.v1.toLong())
+            }
             is FieldValue.I64 -> I64(value.v1)
             is FieldValue.F64 -> F64(value.v1)
             is FieldValue.Bool -> Bool(value.v1)
@@ -84,12 +129,23 @@ public sealed class TantivyValue {
     }
 }
 
-/** Builder handed to [TantivyDocumentAdapter.encode]; call a method per field value (repeat for multi-value fields). */
-public class TantivyDocumentWriter public constructor() {
-    internal val fields = mutableListOf<DocumentField>()
+/**
+ * Builder handed to [TantivyDocumentAdapter.encode]; call a method per field
+ * value (repeat for multi-value fields). Schema-aware: unknown field names and
+ * mismatched value kinds throw [TantivyEncodingException] before anything is
+ * handed to the native side (the Rust core silently drops unknown fields).
+ */
+public class TantivyDocumentWriter public constructor(private val schema: TantivySchema) {
+    private val fields = mutableListOf<DocumentField>()
+    private val counts = mutableMapOf<String, Int>()
 
     public fun value(name: String, value: TantivyValue) {
+        val spec = schema.specFor(name) ?: throw TantivyEncodingException.UnknownField(name, schema.fieldNames)
+        if (!spec.accepts(value)) {
+            throw TantivyEncodingException.ValueKindMismatch(name, spec.kindLabel, value.kindName)
+        }
         fields.add(DocumentField(name, value.toFfi()))
+        counts.merge(name, 1, Int::plus)
     }
 
     public fun text(name: String, value: String): Unit = value(name, TantivyValue.Text(value))
@@ -110,11 +166,16 @@ public class TantivyDocumentWriter public constructor() {
 
     public fun json(name: String, json: String): Unit = value(name, TantivyValue.Json(json))
 
-    public fun build(): TantivyDocumentFields = TantivyDocumentFields(fields.toList())
+    /** How many values have been written for [name] so far. */
+    public fun valueCount(name: String): Int = counts[name] ?: 0
+
+    internal fun firstFfiValue(name: String): FieldValue? = fields.firstOrNull { it.name == name }?.value
+
+    internal fun build(): TantivyDocumentFields = TantivyDocumentFields(fields.toList())
 }
 
 /** Read-side view of a stored document, keyed by field name. Port of Swift's `TantivyDocumentFieldMap`. */
-public class TantivyFieldMap public constructor(doc: TantivyDocumentFields) {
+public class TantivyFieldMap internal constructor(doc: TantivyDocumentFields) {
     private val values: Map<String, List<TantivyValue>> =
         doc.fields.groupBy({ it.name }, { TantivyValue.fromFfi(it.value) })
 
