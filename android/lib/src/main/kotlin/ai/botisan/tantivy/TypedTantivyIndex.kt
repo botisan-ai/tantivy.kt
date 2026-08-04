@@ -23,8 +23,9 @@ public data class TantivySearchResults<T>(val count: Long, val hits: List<Tantiv
 
 /**
  * Typed index over the UniFFI [TantivyIndex] — port of the Swift
- * `TantivySwiftIndex` actor. Operations are serialized through a [Mutex] and
- * run on [Dispatchers.IO].
+ * `TantivySwiftIndex` actor. Operations serialize through a [Mutex] acquired
+ * on the caller's context (waiters suspend there instead of occupying IO
+ * threads); the native work inside the lock runs on [Dispatchers.IO].
  *
  * Failure contract: adapter encoding problems throw [TantivyEncodingException]
  * before anything crosses the FFI; argument-contract violations throw
@@ -193,12 +194,10 @@ public class TypedTantivyIndex<T> private constructor(
      */
     override fun close() {
         runBlocking {
-            withContext(Dispatchers.IO) {
-                mutex.withLock {
-                    if (!closed) {
-                        closed = true
-                        index.destroy()
-                    }
+            mutex.withLock {
+                if (!closed) {
+                    closed = true
+                    withContext(Dispatchers.IO) { index.destroy() }
                 }
             }
         }
@@ -206,11 +205,13 @@ public class TypedTantivyIndex<T> private constructor(
 
     private fun encode(doc: T) = TantivyDocumentWriter(schema).also { adapter.encode(doc, it) }.build()
 
+    // The mutex wraps the IO hop (not the reverse) so a waiter's first
+    // suspension point is the lock itself — contenders queue from the caller's
+    // context, which the concurrency regressions rely on to prove a queued
+    // caller cannot interleave, and waiting costs no IO thread.
     private suspend fun <R> locked(block: () -> R): R =
-        withContext(Dispatchers.IO) {
-            mutex.withLock {
-                check(!closed) { "TypedTantivyIndex is closed" }
-                block()
-            }
+        mutex.withLock {
+            check(!closed) { "TypedTantivyIndex is closed" }
+            withContext(Dispatchers.IO) { block() }
         }
 }

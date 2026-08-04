@@ -2,6 +2,7 @@ package ai.botisan.tantivy
 
 import java.nio.file.Files
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
@@ -15,9 +16,17 @@ import org.junit.Test
 /**
  * Barrier regressions for the single-lock guarantees: compound [TypedTantivyIndex.index]
  * holds add+commit indivisibly, and [TypedTantivyIndex.close] waits out in-flight
- * operations. Gating uses real latches inside the adapter — the gated encode runs
- * inside the locked section on a real IO thread, so the test thread can await and
- * release it deterministically (no delay()-based scheduling assumptions).
+ * operations. The gated encode runs inside the locked section on a real IO thread,
+ * so the test thread can hold the lock open indefinitely; each contender is then
+ * synchronized to the point of no return *before* the gate opens:
+ *
+ * - the concurrent add runs on the test's single-threaded scheduler, where its
+ *   only suspension point before acquiring is `mutex.lock()` itself — when
+ *   `runCurrent()` hands control back, it has provably suspended in the lock
+ *   queue (the mutex is held the whole time);
+ * - the closer signals immediately before calling `close()`, and the test then
+ *   requires `close()` not to return while the lock is held — impossible on the
+ *   fixed implementation, immediate on one that closes without the mutex.
  */
 class TantivyConcurrencyTest {
 
@@ -56,19 +65,29 @@ class TantivyConcurrencyTest {
         val index = TypedTantivyIndex.open(tempIndexPath("compound"), schema, GatedAdapter("gated", entered, release))
 
         val compound = launch(Dispatchers.Default) { index.index(Note("gated", "committed by index()")) }
+        // Once the gated encode has entered, index() holds the mutex and its
+        // block is parked on an IO thread — the lock stays held until released.
         entered.await()
 
-        // index() is mid-encode inside its single lock hold; this add must
-        // queue behind the whole add+commit section, not slip into its commit.
-        val concurrentAdd = launch(Dispatchers.Default) { index.add(Note("pending", "uncommitted")) }
-        assertFalse(concurrentAdd.isCompleted)
-
-        release.countDown()
+        // Deterministic barrier: this contender inherits the test's
+        // single-threaded scheduler, and the first suspension point on its path
+        // is mutex.lock(). runCurrent() runs it on this very thread until it
+        // suspends — which, with the mutex provably held above, can only be
+        // inside the lock queue. No released gate can beat an unstarted caller.
+        val concurrentAdd = launch { index.add(Note("pending", "uncommitted")) }
+        try {
+            testScheduler.runCurrent()
+            assertFalse(compound.isCompleted)
+            assertFalse(concurrentAdd.isCompleted)
+        } finally {
+            // Also on assertion failure — a parked encode must not hang runTest.
+            release.countDown()
+        }
         compound.join()
         concurrentAdd.join()
 
-        // Only index()'s own document is committed. Pre-fix, the FIFO mutex
-        // deterministically let the concurrent add in between add and commit,
+        // Only index()'s own document is committed. With split add/commit lock
+        // holds, the FIFO mutex hands the queued add the lock between them,
         // making this 2.
         assertEquals(1L, index.search(TantivyQuery.All).count)
         index.commit()
@@ -90,17 +109,37 @@ class TantivyConcurrencyTest {
                 inFlightFailure = t
             }
         }
-        entered.await()
+        entered.await() // the operation holds the mutex; its encode is parked on an IO thread
 
-        val closer = launch(Dispatchers.Default) { index.close() }
-        assertFalse(closer.isCompleted) // blocked on the mutex while the operation runs
-
-        release.countDown()
+        val closerStarted = CountDownLatch(1)
+        val closerDone = CountDownLatch(1)
+        val closer = Thread {
+            closerStarted.countDown()
+            index.close()
+            closerDone.countDown()
+        }
+        try {
+            closer.start()
+            closerStarted.await()
+            // With the mutex held, close() cannot return — on the fixed
+            // implementation this await can only run out its full second (that
+            // second is the test's cost, not a scheduling assumption). An
+            // implementation that closes without taking the mutex returns
+            // immediately and trips this assertion deterministically.
+            assertFalse(
+                "close() returned while an operation held the mutex",
+                closerDone.await(1, TimeUnit.SECONDS),
+            )
+        } finally {
+            // Also on assertion failure — a parked encode must not hang runTest.
+            release.countDown()
+        }
         inFlight.join()
         closer.join()
 
         // close() waited: the in-flight compound operation finished cleanly
-        // against a live native index.
+        // against a live native index. Racing destroy() instead makes the
+        // operation throw the FFI's use-after-destroy failure.
         assertNull(inFlightFailure)
 
         try {
