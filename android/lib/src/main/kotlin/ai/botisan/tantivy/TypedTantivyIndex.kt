@@ -5,6 +5,7 @@ import ai.botisan.tantivy.ffi.TantivyIndex
 import ai.botisan.tantivy.ffi.TantivyIndexException
 import java.io.File
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -38,6 +39,9 @@ public class TypedTantivyIndex<T> private constructor(
 
     private val mutex = Mutex()
 
+    @Volatile
+    private var closed = false
+
     public companion object {
         /** Opens (or creates) the index at [path] with [schema]. */
         public suspend fun <T> open(
@@ -60,22 +64,33 @@ public class TypedTantivyIndex<T> private constructor(
     public suspend fun count(): Long = locked { index.docsCount().toLong() }
 
     /** Adds without committing. */
-    public suspend fun add(doc: T): Unit = locked { index.indexDoc(encode(doc)) }
+    public suspend fun add(doc: T): Unit = locked { addUnlocked(doc) }
 
-    public suspend fun addAll(docs: List<T>): Unit = locked { index.indexDocs(docs.map(::encode)) }
+    public suspend fun addAll(docs: List<T>): Unit = locked { addAllUnlocked(docs) }
 
-    /** Adds and commits. */
-    public suspend fun index(doc: T) {
-        add(doc)
-        commit()
+    /**
+     * Adds and commits under one lock hold — like the Swift actor method, no
+     * concurrent caller's uncommitted add can slip between the two steps.
+     */
+    public suspend fun index(doc: T): Unit = locked {
+        addUnlocked(doc)
+        index.commit()
     }
 
-    public suspend fun indexAll(docs: List<T>) {
-        addAll(docs)
-        commit()
+    public suspend fun indexAll(docs: List<T>): Unit = locked {
+        addAllUnlocked(docs)
+        index.commit()
     }
 
     public suspend fun commit(): Unit = locked { index.commit() }
+
+    private fun addUnlocked(doc: T) {
+        index.indexDoc(encode(doc))
+    }
+
+    private fun addAllUnlocked(docs: List<T>) {
+        index.indexDocs(docs.map(::encode))
+    }
 
     /**
      * Deletes any existing document with [doc]'s id value, then adds [doc]
@@ -160,12 +175,31 @@ public class TypedTantivyIndex<T> private constructor(
         return search(combined, limit, offset)
     }
 
+    /**
+     * Takes the operation mutex (waiting out any in-flight operation), then
+     * destroys the native index on [Dispatchers.IO]. Idempotent; afterwards
+     * every operation throws [IllegalStateException].
+     */
     override fun close() {
-        index.destroy()
+        runBlocking {
+            withContext(Dispatchers.IO) {
+                mutex.withLock {
+                    if (!closed) {
+                        closed = true
+                        index.destroy()
+                    }
+                }
+            }
+        }
     }
 
     private fun encode(doc: T) = TantivyDocumentWriter(schema).also { adapter.encode(doc, it) }.build()
 
     private suspend fun <R> locked(block: () -> R): R =
-        withContext(Dispatchers.IO) { mutex.withLock { block() } }
+        withContext(Dispatchers.IO) {
+            mutex.withLock {
+                check(!closed) { "TypedTantivyIndex is closed" }
+                block()
+            }
+        }
 }
