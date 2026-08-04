@@ -1,6 +1,7 @@
 package ai.botisan.tantivy
 
 import ai.botisan.tantivy.ffi.TantivyDocumentFields
+import ai.botisan.tantivy.ffi.TantivyIndexException
 import java.nio.file.Files
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.Json
@@ -12,6 +13,7 @@ import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 /**
@@ -346,6 +348,68 @@ class TantivyIndexTest {
                 ).count,
             )
         }
+    }
+
+    // -------------------------------------- batch and staged-delete contracts
+
+    private data class Tagged(val id: String, val tag: String)
+
+    private object TaggedAdapter : TantivyDocumentAdapter<Tagged> {
+        override fun encode(value: Tagged, doc: TantivyDocumentWriter) {
+            doc.text("id", value.id)
+            doc.facet("tag", value.tag)
+        }
+
+        override fun decode(fields: TantivyFieldMap): Tagged =
+            Tagged(fields.text("id")!!, fields.facet("tag")!!)
+    }
+
+    private val taggedSchema = tantivySchema {
+        idField("id")
+        facetField("tag")
+    }
+
+    /**
+     * A natively-invalid value (facet without a leading slash) in a later
+     * batch document must reject the whole batch with nothing pending and
+     * nothing committed — the earlier valid document must not survive in the
+     * writer as an orphan for a later commit to publish.
+     */
+    @Test
+    fun indexAllAddsNothingWhenALaterDocumentFailsNativeValidation() = runTest {
+        val index = TypedTantivyIndex.open(tempIndexPath("batch-atomicity"), taggedSchema, TaggedAdapter)
+        try {
+            index.indexAll(listOf(Tagged("a", "/ok"), Tagged("b", "not-a-facet")))
+            fail("expected the native facet validation to reject the batch")
+        } catch (_: TantivyIndexException) {
+            // Facet::from_text rejects the second document.
+        }
+        index.commit()
+        assertEquals(0L, index.search(TantivyQuery.All).count)
+
+        index.indexAll(listOf(Tagged("a", "/ok"), Tagged("b", "/ok")))
+        assertEquals(2L, index.search(TantivyQuery.All).count)
+        index.close()
+    }
+
+    /**
+     * [TypedTantivyIndex.deleteDocWithoutCommit] stages the delete in the open
+     * transaction: it masks the pending add before it, publishes nothing on
+     * its own, and leaves a later add of the same id value untouched.
+     */
+    @Test
+    fun deleteDocWithoutCommitMasksOnlyDocumentsAddedBeforeIt() = runTest {
+        val index = TypedTantivyIndex.open(tempIndexPath("staged-delete"), taggedSchema, TaggedAdapter)
+        index.add(Tagged("x", "/old"))
+        index.deleteDocWithoutCommit("id", TantivyValue.Text("x"))
+        // Nothing became durable from the staged delete itself.
+        assertEquals(0L, index.search(TantivyQuery.All).count)
+
+        index.add(Tagged("x", "/new"))
+        index.commit()
+        assertEquals(1L, index.search(TantivyQuery.All).count)
+        assertEquals("/new", index.getDoc("id", TantivyValue.Text("x")).tag)
+        index.close()
     }
 
     // --------------------------------------------------------- index factories

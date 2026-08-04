@@ -119,6 +119,17 @@ public class TypedTantivyIndex<T> private constructor(
     public suspend fun deleteDoc(field: String, value: TantivyValue): Unit =
         locked { index.deleteDoc(DocumentField(field, value.toFfi())) }
 
+    /**
+     * Stages a delete without committing: documents already added — committed
+     * or pending — whose [field] equals [value] are masked at the next
+     * [commit], while documents added after this call are unaffected (Tantivy
+     * applies deletes in operation order). Unlike [deleteDoc], nothing becomes
+     * durable here, so a caller can roll back its own pending adds without
+     * publishing anyone else's uncommitted work.
+     */
+    public suspend fun deleteDocWithoutCommit(field: String, value: TantivyValue): Unit =
+        locked { index.deleteDocUncommitted(DocumentField(field, value.toFfi())) }
+
     public suspend fun docExists(field: String, value: TantivyValue): Boolean =
         locked { index.docExists(DocumentField(field, value.toFfi())) }
 

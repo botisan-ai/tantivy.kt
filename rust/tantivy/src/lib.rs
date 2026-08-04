@@ -1022,11 +1022,11 @@ impl TantivyIndex {
     fn index_docs(&self, docs: Vec<TantivyDocumentFields>) -> Result<(), TantivyIndexError> {
         let schema = self.index.schema();
 
-        let writer = match self.writer.lock() {
-            Ok(wtr) => wtr,
-            Err(_) => return Err(TantivyIndexError::WriterAcquisitionError),
-        };
-
+        // Build (and thereby run every fallible field conversion for) all
+        // documents before any reaches the writer: a bad value in a later
+        // document must not leave earlier batch documents pending in the
+        // uncommitted transaction.
+        let mut tantivy_docs = Vec::with_capacity(docs.len());
         for doc in docs {
             let mut tantivy_doc = TantivyDocument::default();
             for field in doc.fields {
@@ -1034,6 +1034,15 @@ impl TantivyIndex {
                     add_field_value(&mut tantivy_doc, field_handle, &field.value)?;
                 }
             }
+            tantivy_docs.push(tantivy_doc);
+        }
+
+        let writer = match self.writer.lock() {
+            Ok(wtr) => wtr,
+            Err(_) => return Err(TantivyIndexError::WriterAcquisitionError),
+        };
+
+        for tantivy_doc in tantivy_docs {
             writer.add_document(tantivy_doc)?;
         }
 
@@ -1066,6 +1075,26 @@ impl TantivyIndex {
         writer.delete_term(term);
         writer.commit()?;
         self.reader.reload()?;
+
+        Ok(())
+    }
+
+    /// Stages a delete without committing. Tantivy applies deletes in operation
+    /// order, so this masks documents added (committed or pending) before the
+    /// call and leaves later adds of the same value untouched — which lets a
+    /// caller roll back its own pending adds without publishing anyone else's
+    /// uncommitted work the way `delete_doc`'s internal commit would.
+    #[uniffi::method]
+    fn delete_doc_uncommitted(&self, id: DocumentField) -> Result<(), TantivyIndexError> {
+        let schema = self.index.schema();
+        let term = term_from_document_field(&schema, &id)?;
+
+        let writer = match self.writer.lock() {
+            Ok(wtr) => wtr,
+            Err(_) => return Err(TantivyIndexError::WriterAcquisitionError),
+        };
+
+        writer.delete_term(term);
 
         Ok(())
     }
@@ -1248,3 +1277,76 @@ impl TantivyIndex {
 }
 
 uniffi::setup_scaffolding!();
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fresh_index(name: &str) -> TantivyIndex {
+        let dir = std::env::temp_dir().join(format!("tantivy-kt-{}-{}", name, std::process::id()));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        let builder = TantivySchemaBuilder::new();
+        builder.add_text_field("id".to_string(), TextFieldOptions::default());
+        builder.add_facet_field("tag".to_string(), FacetFieldOptions::default());
+        TantivyIndex::new_with_schema(dir.to_string_lossy().into_owned(), &builder).unwrap()
+    }
+
+    fn doc(id: &str, tag: &str) -> TantivyDocumentFields {
+        TantivyDocumentFields {
+            fields: vec![
+                DocumentField {
+                    name: "id".to_string(),
+                    value: FieldValue::Text(id.to_string()),
+                },
+                DocumentField {
+                    name: "tag".to_string(),
+                    value: FieldValue::Facet(tag.to_string()),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn index_docs_adds_nothing_when_a_later_document_fails_validation() {
+        let index = fresh_index("batch-atomicity");
+        // "not-a-facet" fails Facet::from_text after the first document would
+        // already have reached the writer under a build-as-you-add loop.
+        let result = index.index_docs(vec![doc("a", "/ok"), doc("b", "not-a-facet")]);
+        assert!(result.is_err());
+
+        index.commit().unwrap();
+        assert_eq!(index.docs_count(), 0, "the valid batch document must not survive as an orphan");
+
+        index.index_docs(vec![doc("a", "/ok"), doc("b", "/ok")]).unwrap();
+        index.commit().unwrap();
+        assert_eq!(index.docs_count(), 2);
+    }
+
+    #[test]
+    fn delete_doc_uncommitted_masks_only_documents_added_before_it() {
+        let index = fresh_index("staged-delete");
+        let id = |v: &str| DocumentField {
+            name: "id".to_string(),
+            value: FieldValue::Text(v.to_string()),
+        };
+
+        index.index_doc(doc("x", "/old")).unwrap();
+        index.delete_doc_uncommitted(id("x")).unwrap();
+        // Nothing becomes durable from the staged delete itself.
+        assert_eq!(index.docs_count(), 0);
+
+        // A later add of the same value is untouched by the earlier delete.
+        index.index_doc(doc("x", "/new")).unwrap();
+        index.commit().unwrap();
+        assert_eq!(index.docs_count(), 1);
+        let stored = index.get_doc(id("x")).unwrap();
+        let tag = stored
+            .fields
+            .iter()
+            .find(|f| f.name == "tag")
+            .map(|f| f.value.clone());
+        assert!(matches!(tag, Some(FieldValue::Facet(path)) if path == "/new"));
+    }
+}
