@@ -2,10 +2,19 @@ package ai.botisan.tantivy
 
 import java.nio.file.Files
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -16,17 +25,17 @@ import org.junit.Test
 /**
  * Barrier regressions for the single-lock guarantees: compound [TypedTantivyIndex.index]
  * holds add+commit indivisibly, and [TypedTantivyIndex.close] waits out in-flight
- * operations. The gated encode runs inside the locked section on a real IO thread,
- * so the test thread can hold the lock open indefinitely; each contender is then
- * synchronized to the point of no return *before* the gate opens:
+ * operations. Test-only callbacks live at the production lock boundary, so the
+ * tests observe positive events instead of inferring coroutine scheduling from
+ * `Job.isCompleted` or from a latch outside [TypedTantivyIndex.close]:
  *
- * - the concurrent add runs on the test's single-threaded scheduler, where its
- *   only suspension point before acquiring is `mutex.lock()` itself — when
- *   `runCurrent()` hands control back, it has provably suspended in the lock
- *   queue (the mutex is held the whole time);
- * - the closer signals immediately before calling `close()`, and the test then
- *   requires `close()` not to return while the lock is held — impossible on the
- *   fixed implementation, immediate on one that closes without the mutex.
+ * - an after-unlock seam deterministically pauses `index()` after its single
+ *   lock hold. On the old split-lock implementation the same seam lands between
+ *   add and commit, letting the concurrent add become observably committed;
+ * - a close-boundary seam proves `close()` itself has entered before the test
+ *   checks that an in-flight operation keeps the native index alive;
+ * - a single-thread dispatcher reproduces the caller-dispatcher inversion that
+ *   deadlocks when the mutex is released only after returning from IO.
  */
 class TantivyConcurrencyTest {
 
@@ -59,36 +68,39 @@ class TantivyConcurrencyTest {
         Files.createTempDirectory("tantivy-$name").toAbsolutePath().toString()
 
     @Test
-    fun indexHoldsAddAndCommitAgainstAConcurrentAdd() = runTest {
+    fun indexHoldsAddAndCommitAgainstAConcurrentAdd() = runBlocking {
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
         val index = TypedTantivyIndex.open(tempIndexPath("compound"), schema, GatedAdapter("gated", entered, release))
 
-        val compound = launch(Dispatchers.Default) { index.index(Note("gated", "committed by index()")) }
-        // Once the gated encode has entered, index() holds the mutex and its
-        // block is parked on an IO thread — the lock stays held until released.
-        entered.await()
-
-        // Deterministic barrier: this contender inherits the test's
-        // single-threaded scheduler, and the first suspension point on its path
-        // is mutex.lock(). runCurrent() runs it on this very thread until it
-        // suspends — which, with the mutex provably held above, can only be
-        // inside the lock queue. No released gate can beat an unstarted caller.
-        val concurrentAdd = launch { index.add(Note("pending", "uncommitted")) }
-        try {
-            testScheduler.runCurrent()
-            assertFalse(compound.isCompleted)
-            assertFalse(concurrentAdd.isCompleted)
-        } finally {
-            // Also on assertion failure — a parked encode must not hang runTest.
-            release.countDown()
+        val firstUnlock = CountDownLatch(1)
+        val allowCompoundToReturn = CountDownLatch(1)
+        val interceptNextUnlock = AtomicBoolean(true)
+        index.afterUnlockForTest = {
+            if (interceptNextUnlock.compareAndSet(true, false)) {
+                firstUnlock.countDown()
+                allowCompoundToReturn.await()
+            }
         }
-        compound.join()
-        concurrentAdd.join()
 
-        // Only index()'s own document is committed. With split add/commit lock
-        // holds, the FIFO mutex hands the queued add the lock between them,
-        // making this 2.
+        val compound = async(Dispatchers.Default) { index.index(Note("gated", "committed by index()")) }
+        try {
+            assertTrue(entered.await(10, TimeUnit.SECONDS))
+            release.countDown()
+            assertTrue(firstUnlock.await(10, TimeUnit.SECONDS))
+
+            // The fixed implementation reaches this seam only after add+commit.
+            // On the checkpoint's split-lock implementation it reaches the same
+            // seam after add and before commit, so this add is committed by the
+            // resumed compound call and the public assertion below turns red.
+            async(Dispatchers.Default) { index.add(Note("pending", "uncommitted")) }.await()
+        } finally {
+            release.countDown()
+            allowCompoundToReturn.countDown()
+        }
+        compound.await()
+        index.afterUnlockForTest = null
+
         assertEquals(1L, index.search(TantivyQuery.All).count)
         index.commit()
         assertEquals(2L, index.search(TantivyQuery.All).count)
@@ -96,51 +108,51 @@ class TantivyConcurrencyTest {
     }
 
     @Test
-    fun closeWaitsForInFlightOperationAndPostCloseCallsFail() = runTest {
+    fun closeWaitsForInFlightOperationAndPostCloseCallsFail() = runBlocking {
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
         val index = TypedTantivyIndex.open(tempIndexPath("close-race"), schema, GatedAdapter("gated", entered, release))
 
-        var inFlightFailure: Throwable? = null
-        val inFlight = launch(Dispatchers.Default) {
+        val inFlightFailure = AtomicReference<Throwable?>()
+        val inFlight = async(Dispatchers.Default) {
             try {
                 index.index(Note("gated", "in flight"))
             } catch (t: Throwable) {
-                inFlightFailure = t
+                inFlightFailure.set(t)
             }
         }
-        entered.await() // the operation holds the mutex; its encode is parked on an IO thread
+        assertTrue(entered.await(10, TimeUnit.SECONDS))
 
-        val closerStarted = CountDownLatch(1)
+        val closeArrived = CountDownLatch(1)
+        val allowCloseAttempt = CountDownLatch(1)
         val closerDone = CountDownLatch(1)
+        index.lockBoundaryForTest = { boundary ->
+            if (boundary == TantivyLockBoundary.CLOSE) {
+                closeArrived.countDown()
+                allowCloseAttempt.await()
+            }
+        }
         val closer = Thread {
-            closerStarted.countDown()
             index.close()
             closerDone.countDown()
-        }
+        }.apply { isDaemon = true }
         try {
             closer.start()
-            closerStarted.await()
-            // With the mutex held, close() cannot return — on the fixed
-            // implementation this await can only run out its full second (that
-            // second is the test's cost, not a scheduling assumption). An
-            // implementation that closes without taking the mutex returns
-            // immediately and trips this assertion deterministically.
+            assertTrue(closeArrived.await(10, TimeUnit.SECONDS))
+            allowCloseAttempt.countDown()
             assertFalse(
                 "close() returned while an operation held the mutex",
                 closerDone.await(1, TimeUnit.SECONDS),
             )
         } finally {
-            // Also on assertion failure — a parked encode must not hang runTest.
+            allowCloseAttempt.countDown()
             release.countDown()
         }
-        inFlight.join()
+        inFlight.await()
         closer.join()
+        index.lockBoundaryForTest = null
 
-        // close() waited: the in-flight compound operation finished cleanly
-        // against a live native index. Racing destroy() instead makes the
-        // operation throw the FFI's use-after-destroy failure.
-        assertNull(inFlightFailure)
+        assertNull(inFlightFailure.get())
 
         try {
             index.count()
@@ -149,5 +161,52 @@ class TantivyConcurrencyTest {
             assertTrue(expected.message!!.contains("closed"))
         }
         index.close() // idempotent
+    }
+
+    @Test
+    fun closeDoesNotDeadlockTheCallerDispatcherNeededByAnInFlightOperation() {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val index = runBlocking {
+            TypedTantivyIndex.open(
+                tempIndexPath("same-dispatcher-close"),
+                schema,
+                GatedAdapter("gated", entered, release),
+            )
+        }
+        val executor = Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "tantivy-single-caller").apply { isDaemon = true }
+        }
+        val callerDispatcher = executor.asCoroutineDispatcher()
+        val scope = CoroutineScope(SupervisorJob() + callerDispatcher)
+        val inFlight = scope.async { index.index(Note("gated", "in flight")) }
+        val closeArrived = CountDownLatch(1)
+        index.lockBoundaryForTest = { boundary ->
+            if (boundary == TantivyLockBoundary.CLOSE) closeArrived.countDown()
+        }
+
+        var closeFuture: Future<*>? = null
+        try {
+            assertTrue(entered.await(10, TimeUnit.SECONDS))
+            // The in-flight coroutine is now suspended in IO, leaving its
+            // single caller thread free to enter synchronous close().
+            val closeTask = executor.submit { index.close() }
+            closeFuture = closeTask
+            assertTrue(closeArrived.await(10, TimeUnit.SECONDS))
+            release.countDown()
+            // If unlocking requires dispatching the operation back to this
+            // blocked executor first, this bounded wait exposes the cycle.
+            closeTask.get(5, TimeUnit.SECONDS)
+
+            runBlocking { withTimeout(5_000) { inFlight.await() } }
+            assertTrue(closeTask.isDone)
+        } finally {
+            release.countDown()
+            index.lockBoundaryForTest = null
+            closeFuture?.cancel(true)
+            scope.cancel()
+            callerDispatcher.close()
+            executor.shutdownNow()
+        }
     }
 }

@@ -71,7 +71,7 @@ TypedTantivyIndex.open(dir, schema, ReceiptAdapter).use { index ->      // File 
 }
 ```
 
-All operations are `suspend` (serialized internally, run on `Dispatchers.IO`). Compound operations hold that one lock across all their steps — `index`/`indexAll` (add + commit) and `upsert` (delete-by-id + add) admit no concurrent caller in between. `close()` waits for the in-flight operation, destroys the native index on `Dispatchers.IO`, and is idempotent; afterwards every operation throws `IllegalStateException`. Query nodes: `All`, `Empty`, `Term`, `TermSet`, `Boolean`, `Phrase`, `PhrasePrefix`, `Range`, `Regex`, `Fuzzy`, `Exists`, `Boost`, `ConstScore`, `DisjunctionMax`, `QueryString` (with per-field fuzzy config). Dates are epoch **microseconds** (`TantivyValue.DateMicros`).
+All operations are `suspend` (serialized internally, run on `Dispatchers.IO`). The complete mutex hold — acquisition, native work, and release — stays on IO, so synchronous `close()` cannot deadlock a confined caller thread that an in-flight operation needs to resume on. Compound operations hold that one lock across all their steps — `index`/`indexAll` (add + commit) and `upsert` (delete-by-id + add) admit no concurrent caller in between. `close()` waits for the in-flight operation, destroys the native index on `Dispatchers.IO`, and is idempotent; afterwards every operation throws `IllegalStateException`. Query nodes: `All`, `Empty`, `Term`, `TermSet`, `Boolean`, `Phrase`, `PhrasePrefix`, `Range`, `Regex`, `Fuzzy`, `Exists`, `Boost`, `ConstScore`, `DisjunctionMax`, `QueryString` (with per-field fuzzy config). Dates are epoch **microseconds** (`TantivyValue.DateMicros`).
 
 Contract notes:
 

@@ -21,11 +21,14 @@ public data class TantivySearchHit<T>(val score: Float, val doc: T)
 
 public data class TantivySearchResults<T>(val count: Long, val hits: List<TantivySearchHit<T>>)
 
+internal enum class TantivyLockBoundary { OPERATION, CLOSE }
+
 /**
  * Typed index over the UniFFI [TantivyIndex] — port of the Swift
- * `TantivySwiftIndex` actor. Operations serialize through a [Mutex] acquired
- * on the caller's context (waiters suspend there instead of occupying IO
- * threads); the native work inside the lock runs on [Dispatchers.IO].
+ * `TantivySwiftIndex` actor. Operations serialize through a [Mutex], with the
+ * whole lock hold and native work on [Dispatchers.IO]. Acquiring and releasing
+ * there keeps synchronous [close] from blocking a confined caller dispatcher
+ * that an in-flight operation would otherwise need in order to unlock.
  *
  * Failure contract: adapter encoding problems throw [TantivyEncodingException]
  * before anything crosses the FFI; argument-contract violations throw
@@ -42,6 +45,14 @@ public class TypedTantivyIndex<T> private constructor(
 
     @Volatile
     private var closed = false
+
+    /** Positive lock-boundary signal for deterministic concurrency regressions. */
+    @Volatile
+    internal var lockBoundaryForTest: ((TantivyLockBoundary) -> Unit)? = null
+
+    /** Pauses immediately after a successful operation unlock; test-only. */
+    @Volatile
+    internal var afterUnlockForTest: (() -> Unit)? = null
 
     public companion object {
         /** Opens (or creates) the index at [path] with [schema]. */
@@ -193,11 +204,12 @@ public class TypedTantivyIndex<T> private constructor(
      * every operation throws [IllegalStateException].
      */
     override fun close() {
-        runBlocking {
+        runBlocking(Dispatchers.IO) {
+            lockBoundaryForTest?.invoke(TantivyLockBoundary.CLOSE)
             mutex.withLock {
                 if (!closed) {
                     closed = true
-                    withContext(Dispatchers.IO) { index.destroy() }
+                    index.destroy()
                 }
             }
         }
@@ -205,13 +217,16 @@ public class TypedTantivyIndex<T> private constructor(
 
     private fun encode(doc: T) = TantivyDocumentWriter(schema).also { adapter.encode(doc, it) }.build()
 
-    // The mutex wraps the IO hop (not the reverse) so a waiter's first
-    // suspension point is the lock itself — contenders queue from the caller's
-    // context, which the concurrency regressions rely on to prove a queued
-    // caller cannot interleave, and waiting costs no IO thread.
-    private suspend fun <R> locked(block: () -> R): R =
-        mutex.withLock {
+    // Keep acquisition, native work, and release in IO. If release required a
+    // hop back to a confined caller dispatcher, synchronous close() on that
+    // dispatcher could block the very continuation that must unlock the mutex.
+    private suspend fun <R> locked(block: () -> R): R = withContext(Dispatchers.IO) {
+        lockBoundaryForTest?.invoke(TantivyLockBoundary.OPERATION)
+        val result = mutex.withLock {
             check(!closed) { "TypedTantivyIndex is closed" }
-            withContext(Dispatchers.IO) { block() }
+            block()
         }
+        afterUnlockForTest?.invoke()
+        result
+    }
 }
