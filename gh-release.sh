@@ -7,6 +7,8 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+export ANDROID_HOME="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
+
 ARTIFACT="tantivy-android"
 VERSION=$(grep '^version=' android/gradle.properties | cut -d= -f2)
 
