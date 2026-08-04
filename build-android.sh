@@ -8,6 +8,7 @@ export ANDROID_HOME="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
 # Pinned toolchain: fail loudly instead of floating to whatever is installed.
 NDK_PIN="28.2.13676358"
 CARGO_NDK_PIN="4.1.2"
+BUILD_TOOLS_PIN="36.1.0"
 export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$NDK_PIN"
 if [ ! -d "$ANDROID_NDK_HOME" ]; then
   echo "FAIL: NDK $NDK_PIN not installed (expected at $ANDROID_NDK_HOME)" >&2
@@ -19,6 +20,11 @@ if [ "$CARGO_NDK_VERSION" != "$CARGO_NDK_PIN" ]; then
   exit 1
 fi
 READELF="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-readelf"
+ZIPALIGN="$ANDROID_HOME/build-tools/$BUILD_TOOLS_PIN/zipalign"
+if [ ! -x "$ZIPALIGN" ]; then
+  echo "FAIL: Android build-tools $BUILD_TOOLS_PIN not installed (expected $ZIPALIGN)" >&2
+  exit 1
+fi
 
 CRATE="tantivy-kt"
 LIB_NAME="libtantivy.so"
@@ -40,7 +46,20 @@ for so in rust/target/jniLibs/*/"$LIB_NAME"; do
 done
 
 echo "==> gradle test + lintRelease + assembleRelease (includes the R8 minified-smoke app)"
-(cd android && ./gradlew --console=plain test lintRelease assembleRelease :minified-smoke:assembleAndroidTest)
+(cd android && ./gradlew --console=plain test lintRelease assembleRelease :lib:assembleDebugAndroidTest :minified-smoke:assembleAndroidTest)
+
+echo "==> APK 16 KB ZIP-alignment gate"
+for apk in \
+  android/lib/build/outputs/apk/androidTest/debug/lib-debug-androidTest.apk \
+  android/minified-smoke/build/outputs/apk/release/minified-smoke-release.apk \
+  android/minified-smoke/build/outputs/apk/androidTest/release/minified-smoke-release-androidTest.apk
+do
+  if [ ! -f "$apk" ]; then
+    echo "FAIL: missing packaged smoke APK: $apk" >&2
+    exit 1
+  fi
+  "$ZIPALIGN" -c -P 16 -v 4 "$apk"
+done
 
 echo "==> AAR:"
 ls -la android/lib/build/outputs/aar/

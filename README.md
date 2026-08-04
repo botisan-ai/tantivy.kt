@@ -85,7 +85,7 @@ Contract notes:
 ## Development
 
 ```bash
-./build-android.sh     # rust gates -> cargo ndk (arm64-v8a + x86_64, API 24) -> 16 KB gate -> gradle test + lintRelease + assembleRelease
+./build-android.sh     # rust gates -> cargo ndk -> ELF + packaged-smoke-APK 16 KB gates -> gradle test/lint/assemble
 ./gh-release.sh        # gates + publish GitHub Release with maven.zip + aar + sha256 assets
 cd android && ./gradlew test          # host-JVM tests (builds host dylib automatically)
 cd android && ./gradlew connectedAndroidTest   # on-device/emulator smokes, incl. :minified-smoke (R8 with the consumer rules)
